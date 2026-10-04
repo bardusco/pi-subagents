@@ -1301,7 +1301,7 @@ export default function (pi: ExtensionAPI) {
     // this index, so it is written exactly once.
     const transcriptAnchor = existing.session?.messages.length ?? 0;
 
-    const { state: bgState, callbacks: bgCallbacks } = createActivityTracker(opts.maxTurns);
+    const { state: bgState, callbacks: bgCallbacks } = createActivityTracker(normalizeMaxTurns(opts.maxTurns));
     // resumeAgent has no onSessionCreated — the session predates this run —
     // so seed it directly, or the widget shows no context % for the agent.
     bgState.session = existing.session;
@@ -1312,6 +1312,8 @@ export default function (pi: ExtensionAPI) {
     // run_in_background in that same turn keep going.
     const record = await manager.resume(id, prompt, undefined, {
       isBackground: true,
+      maxTurns: opts.maxTurns,
+      onTurnEnd: bgCallbacks.onTurnEnd,
       onToolActivity: bgCallbacks.onToolActivity,
       onAssistantUsage: bgCallbacks.onAssistantUsage,
       // Fires when the run actually starts — immediately, or on queue
@@ -1618,8 +1620,8 @@ Terse command-style prompts produce shallow, generic work.
       ),
       max_turns: Type.Optional(
         Type.Number({
-          description: "Maximum number of agentic turns before stopping. Omit for unlimited (default).",
-          minimum: 1,
+          description: "Maximum number of agentic turns before stopping, including resumes. Zero or omit for unlimited (default).",
+          minimum: 0,
         }),
       ),
       run_in_background: Type.Optional(
@@ -1783,7 +1785,9 @@ Terse command-style prompts produce shallow, generic work.
       // make a live agent unresumable the moment its type is deleted, disabled,
       // or gains a case-clashing sibling. Only a real spawn is gated.
       if (!dispatch.ok && !params.resume) return textResult(dispatch.message);
-      const subagentType = dispatch.ok ? dispatch.type : rawType;
+      const subagentType = params.resume
+        ? manager.getRecord(params.resume)?.type ?? rawType
+        : dispatch.ok ? dispatch.type : rawType;
       // What the caller actually asked for, named once: `fellBackFrom` is "" for
       // a blank request, so reading it inline invites the `??`-vs-`||` slip that
       // once persisted an empty type into a scheduled job.
@@ -1809,7 +1813,7 @@ Terse command-style prompts produce shallow, generic work.
 
       // Resolve model from agent config first; tool-call params only fill gaps.
       let model = ctx.model;
-      if (resolvedConfig.modelInput) {
+      if (!params.resume && resolvedConfig.modelInput) {
         const resolved = resolveModel(resolvedConfig.modelInput, ctx.modelRegistry);
         if (typeof resolved === "string") {
           if (resolvedConfig.modelFromParams) return textResult(resolved);
@@ -1830,8 +1834,8 @@ Terse command-style prompts produce shallow, generic work.
         agentLabel: customConfig?.displayName ?? subagentType,
         modelInput: resolvedConfig.modelInput,
       });
-      if (scopeVerdict.kind === "error") return textResult(scopeVerdict.message);
-      if (scopeVerdict.kind === "warn") ctx.ui.notify(scopeVerdict.message, "warning");
+      if (!params.resume && scopeVerdict.kind === "error") return textResult(scopeVerdict.message);
+      if (!params.resume && scopeVerdict.kind === "warn") ctx.ui.notify(scopeVerdict.message, "warning");
 
       const thinking = resolvedConfig.thinking;
       const inheritContext = resolvedConfig.inheritContext;
@@ -1997,7 +2001,7 @@ Terse command-style prompts produce shallow, generic work.
 
           const record = await startBackgroundResume(ctx, existing, params.prompt, {
             outputTranscript,
-            maxTurns: effectiveMaxTurns,
+            maxTurns: resolvedConfig.maxTurns ?? getDefaultMaxTurns(),
             toolCallId,
           });
           if (!record) {
@@ -2017,7 +2021,9 @@ Terse command-style prompts produce shallow, generic work.
           );
         }
 
-        const record = await manager.resume(params.resume, params.prompt, signal);
+        const record = await manager.resume(params.resume, params.prompt, signal, {
+          maxTurns: resolvedConfig.maxTurns ?? getDefaultMaxTurns(),
+        });
         if (!record) {
           return textResult(`Failed to resume agent "${params.resume}".`);
         }
@@ -2027,7 +2033,7 @@ Terse command-style prompts produce shallow, generic work.
           return textResult(`Agent failed: ${record.error}${partialOutputSuffix(record)}`, buildDetails(detailBaseFor(record), record));
         }
         return textResult(
-          record.result?.trim() || "No output.",
+          (record.result?.trim() || "No output.") + getForegroundOutcomeNote(record.status),
           buildDetails(detailBaseFor(record), record),
         );
       }

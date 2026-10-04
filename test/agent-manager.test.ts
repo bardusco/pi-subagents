@@ -6,10 +6,10 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import { AgentManager } from "../src/agent-manager.js";
 import type { AgentRecord } from "../src/types.js";
 
-vi.mock("../src/agent-runner.js", () => ({
-  runAgent: vi.fn(),
-  resumeAgent: vi.fn(),
-}));
+vi.mock("../src/agent-runner.js", async () => {
+  const actual = await vi.importActual("../src/agent-runner.js");
+  return { ...actual, runAgent: vi.fn(), resumeAgent: vi.fn() };
+});
 
 vi.mock("../src/worktree.js", () => ({
   createWorktree: vi.fn(),
@@ -2155,6 +2155,74 @@ describe("AgentManager — background resume", () => {
 
     expect(record?.status).toBe("queued");
     expect(resumeAgent).not.toHaveBeenCalled();
+  });
+
+  it.each([false, true])("forwards the cap and turn callbacks; reports partial status (background=%s)", async isBackground => {
+    manager = new AgentManager();
+    const id = await spawnSettled(manager);
+    const onTurnEnd = vi.fn();
+    vi.mocked(resumeAgent).mockImplementation(async (_session, _prompt, opts) => {
+      expect(opts?.maxTurns).toBe(3);
+      opts?.onTurnEnd?.(3);
+      return { text: "partial", aborted: false, steered: true };
+    });
+    const record = await manager.resume(id, "go", undefined, { isBackground, maxTurns: 3, onTurnEnd });
+    if (isBackground) await record!.promise;
+    expect(record?.status).toBe("steered");
+    expect(record?.result).toBe("partial");
+    expect(onTurnEnd).toHaveBeenCalledWith(3);
+  });
+
+  it.each([false, true])("preserves hard-budget abort status (background=%s)", async isBackground => {
+    manager = new AgentManager();
+    const id = await spawnSettled(manager);
+    vi.mocked(resumeAgent).mockResolvedValue({ text: "fragment", aborted: true, steered: true });
+    const record = await manager.resume(id, "go", undefined, { isBackground, maxTurns: 3 });
+    if (isBackground) await record!.promise;
+    expect(record?.status).toBe("aborted");
+  });
+
+  it("reports parent cancellation as stopped when the prompt resolves", async () => {
+    manager = new AgentManager();
+    const id = await spawnSettled(manager);
+    const parent = new AbortController();
+    const removed = vi.spyOn(parent.signal, "removeEventListener");
+    vi.mocked(resumeAgent).mockImplementation(async () => {
+      parent.abort();
+      return { text: "partial", aborted: false, steered: false };
+    });
+    const record = await manager.resume(id, "go", parent.signal);
+    expect(record?.status).toBe("stopped");
+    expect(record?.result).toBe("partial");
+    expect(removed).toHaveBeenCalledWith("abort", expect.any(Function));
+  });
+
+  it("does not execute a foreground resume when its caller is already cancelled", async () => {
+    manager = new AgentManager();
+    const id = await spawnSettled(manager);
+    const parent = new AbortController();
+    const removed = vi.spyOn(parent.signal, "removeEventListener");
+    parent.abort();
+    vi.mocked(resumeAgent).mockClear();
+    const record = await manager.resume(id, "must not execute", parent.signal);
+    expect(resumeAgent).not.toHaveBeenCalled();
+    expect(record?.status).toBe("stopped");
+    expect(record?.completedAt).toBeDefined();
+    expect(removed).toHaveBeenCalledWith("abort", expect.any(Function));
+  });
+
+  it("owns foreground cancellation and does not overwrite stopped on prompt rejection", async () => {
+    manager = new AgentManager();
+    const id = await spawnSettled(manager);
+    vi.mocked(resumeAgent).mockImplementation(async (_session, _prompt, opts) => {
+      expect(opts?.signal?.aborted).toBe(false);
+      manager.abort(id);
+      expect(opts?.signal?.aborted).toBe(true);
+      throw new Error("cancelled");
+    });
+    const record = await manager.resume(id, "go");
+    expect(record?.status).toBe("stopped");
+    expect(record?.error).toBeUndefined();
   });
 
   it("foreground resume is unchanged: awaits inline and does not fire onComplete", async () => {

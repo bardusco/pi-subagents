@@ -19,7 +19,7 @@ import { statSync } from "node:fs";
 import { isAbsolute } from "node:path";
 import type { Model } from "@earendil-works/pi-ai";
 import type { AgentSession, ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
-import { resumeAgent, runAgent, type ToolActivity } from "./agent-runner.js";
+import { resolveEffectiveMaxTurns, resumeAgent, runAgent, type ToolActivity } from "./agent-runner.js";
 import { assignHandle, handleBase } from "./mention.js";
 import { describeModel } from "./model-resolver.js";
 import type { AgentInvocation, AgentRecord, AgentTombstone, IsolationMode, MentionResolution, SubagentType, ThinkingLevel } from "./types.js";
@@ -304,6 +304,8 @@ interface SpawnOptions {
 }
 
 interface ResumeOptions {
+  maxTurns?: number;
+  onTurnEnd?: (turnCount: number) => void;
   /**
    * Run the resumed turn detached in the background: return immediately with
    * the record still "running" (or "queued" at the concurrency limit) and
@@ -1112,6 +1114,8 @@ export class AgentManager {
   ): Promise<AgentRecord | undefined> {
     const record = this.agents.get(id);
     if (!record?.session) return undefined;
+    if (record.status === "running" || record.status === "queued") return undefined;
+    const maxTurns = resolveEffectiveMaxTurns(record.type, options?.maxTurns);
 
     // Background resume: settle asynchronously and notify on completion exactly
     // like a background spawn, returning immediately with the record still
@@ -1129,8 +1133,6 @@ export class AgentManager {
       // whose settle path would abort the LIVE run's children and report a
       // failure for a run that is still going. Refuse instead, leaving the
       // record untouched; the caller decides whether to wait or steer.
-      if (record.status === "running" || record.status === "queued") return undefined;
-
       record.isBackground = true;
       record.resultConsumed = false;
       record.result = undefined;
@@ -1138,7 +1140,7 @@ export class AgentManager {
       record.completedAt = undefined;
       record.status = "queued";
 
-      const start = () => this.startResume(id, record, prompt, signal, options);
+      const start = () => this.startResume(id, record, prompt, signal, { ...options, maxTurns });
       if (occupiesPoolSlot(record) && !this.poolHasRoom("background")) {
         // At the concurrency limit — queue it, drains when a slot frees. A
         // detached resume has no inline caller, hence nothing to release. The
@@ -1173,8 +1175,17 @@ export class AgentManager {
     record.result = undefined;
     record.error = undefined;
 
+    const abortController = new AbortController();
+    record.abortController = abortController;
+    const onParentAbort = () => this.abort(id);
+    signal?.addEventListener("abort", onParentAbort, { once: true });
+    if (signal?.aborted) onParentAbort();
+
     try {
-      const { text, failure } = await resumeAgent(record.session, prompt, {
+      if (abortController.signal.aborted) return record;
+      const { text, failure, aborted, steered } = await resumeAgent(record.session, prompt, {
+        maxTurns,
+        onTurnEnd: options?.onTurnEnd,
         onToolActivity: (activity) => {
           if (activity.type === "end") record.toolUses++;
           options?.onToolActivity?.(activity);
@@ -1189,18 +1200,22 @@ export class AgentManager {
           this.onCompact?.(record, info);
           options?.onCompaction?.(info);
         },
-        signal,
+        signal: abortController.signal,
       });
-      // Same contract as the spawn path (#144): a failed final turn is an
-      // error, not a completion — but the resumed text stays available.
-      record.status = failure ? "error" : "completed";
-      if (failure) record.error = failure;
+      if (this.agents.get(id)?.status !== "stopped") {
+        record.status = aborted ? "aborted" : failure ? "error" : steered ? "steered" : "completed";
+        if (failure) record.error = failure;
+      }
       record.result = text;
       record.completedAt = Date.now();
     } catch (err) {
-      record.status = "error";
-      record.error = err instanceof Error ? err.message : String(err);
+      if (this.agents.get(id)?.status !== "stopped") {
+        record.status = "error";
+        record.error = err instanceof Error ? err.message : String(err);
+      }
       record.completedAt = Date.now();
+    } finally {
+      signal?.removeEventListener("abort", onParentAbort);
     }
 
     // Same contract as the spawn settle paths: children spawned during the
@@ -1266,6 +1281,8 @@ export class AgentManager {
     };
 
     const promise = resumeAgent(record.session, prompt, {
+      maxTurns: options.maxTurns,
+      onTurnEnd: options.onTurnEnd,
       onToolActivity: (activity) => {
         if (activity.type === "end") record.toolUses++;
         options.onToolActivity?.(activity);
@@ -1282,12 +1299,12 @@ export class AgentManager {
       },
       signal: abortController.signal,
     })
-      .then(({ text, failure }) => {
+      .then(({ text, failure, aborted, steered }) => {
         // Don't overwrite status if externally stopped via abort().
         if (record.status !== "stopped") {
           // Same contract as the spawn path (#144): a failed final turn is an
           // error, not a completion — but the resumed text stays available.
-          record.status = failure ? "error" : "completed";
+          record.status = aborted ? "aborted" : failure ? "error" : steered ? "steered" : "completed";
           if (failure) record.error = failure;
         }
         record.result = text;

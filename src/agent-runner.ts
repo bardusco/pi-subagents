@@ -1158,9 +1158,11 @@ export async function resumeAgent(
     onToolActivity?: (activity: ToolActivity) => void;
     onAssistantUsage?: (usage: LifetimeUsage) => void;
     onCompaction?: (info: { reason: "manual" | "threshold" | "overflow"; tokensBefore: number }) => void;
+    maxTurns?: number;
+    onTurnEnd?: (turnCount: number) => void;
     signal?: AbortSignal;
   } = {},
-): Promise<{ text: string; failure?: string }> {
+): Promise<{ text: string; failure?: string; aborted: boolean; steered: boolean }> {
   // Boundary for the history fallback: the session already holds prior turns,
   // so only assistant text produced by THIS resume prompt counts as its output
   // — a failed resume must not surface the previous turn's answer (#144).
@@ -1168,8 +1170,24 @@ export async function resumeAgent(
   const collector = collectResponseText(session);
   const cleanupAbort = forwardAbortSignal(session, options.signal);
 
-  const unsubEvents = (options.onToolActivity || options.onAssistantUsage || options.onCompaction)
-    ? session.subscribe((event: AgentSessionEvent) => {
+  let turnCount = 0;
+  const maxTurns = normalizeMaxTurns(options.maxTurns);
+  let softLimitReached = false;
+  let aborted = false;
+  const unsubEvents = session.subscribe((event: AgentSessionEvent) => {
+        if (event.type === "turn_end") {
+          turnCount++;
+          options.onTurnEnd?.(turnCount);
+          if (maxTurns != null) {
+            if (!softLimitReached && turnCount >= maxTurns) {
+              softLimitReached = true;
+              session.steer("You have reached your turn limit. Wrap up immediately — provide your final answer now.");
+            } else if (softLimitReached && turnCount >= maxTurns + graceTurns) {
+              aborted = true;
+              session.abort();
+            }
+          }
+        }
         if (event.type === "tool_execution_start") options.onToolActivity?.({ type: "start", toolName: event.toolName });
         if (event.type === "tool_execution_end") options.onToolActivity?.({ type: "end", toolName: event.toolName });
         if (event.type === "message_end" && event.message.role === "assistant") {
@@ -1185,8 +1203,7 @@ export async function resumeAgent(
         if (event.type === "compaction_end" && !event.aborted && event.result) {
           options.onCompaction?.({ reason: event.reason, tokensBefore: event.result.tokensBefore });
         }
-      })
-    : () => {};
+      });
 
   try {
     await session.prompt(prompt);
@@ -1199,6 +1216,8 @@ export async function resumeAgent(
   return {
     text: collector.getText().trim() || getLastAssistantText(session, startLen),
     failure: finalTurnError(session, startLen),
+    aborted,
+    steered: softLimitReached,
   };
 }
 

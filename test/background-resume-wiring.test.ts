@@ -264,6 +264,54 @@ describe("Agent tool — background resume wiring", () => {
     await lifecycle.get("session_shutdown")?.({}, ctx);
   });
 
+  it.each([false, true])("uses the original type cap and ignores a new model (background=%s)", async runInBackground => {
+    writeFileSync(join(agentDir, "agents", "budget.md"), "---\nname: budget\ndescription: Budgeted agent\nmax_turns: 2\n---\n\nRead only.");
+    const { pi, tools, lifecycle } = makePi();
+    subagentsExtension(pi);
+    const ctx = makeCtx(cwd);
+    const id = await spawnSettled(tools, ctx, "budget");
+    const res = await tools.get("Agent").execute(
+      "resume-call",
+      { prompt: "continue", description: "Continue", subagent_type: "general-purpose", model: "missing/provider", resume: id, max_turns: 9, run_in_background: runInBackground },
+      undefined, undefined, ctx,
+    );
+    expect(resultText(res)).not.toContain("not found");
+    expect(vi.mocked(resumeAgent).mock.calls.at(-1)?.[2]?.maxTurns).toBe(2);
+    await lifecycle.get("session_shutdown")?.({}, ctx);
+  });
+
+  it.each([false, true])("forwards explicit zero through the resume route (background=%s)", async runInBackground => {
+    writeFileSync(join(cwd, ".pi", "subagents.json"), JSON.stringify({ schedulingEnabled: false, defaultMaxTurns: 5 }));
+    const { pi, tools, lifecycle } = makePi();
+    subagentsExtension(pi);
+    const ctx = makeCtx(cwd);
+    const id = await spawnSettled(tools, ctx);
+    expect(tools.get("Agent").parameters.properties.max_turns.minimum).toBe(0);
+    await tools.get("Agent").execute(
+      "resume-call",
+      { prompt: "continue", description: "Continue", subagent_type: "general-purpose", resume: id, max_turns: 0, run_in_background: runInBackground },
+      undefined, undefined, ctx,
+    );
+    expect(vi.mocked(resumeAgent).mock.calls.at(-1)?.[2]?.maxTurns).toBeUndefined();
+    await lifecycle.get("session_shutdown")?.({}, ctx);
+  });
+
+  it("makes foreground budget-limited output visibly partial to the parent", async () => {
+    const { pi, tools, lifecycle } = makePi();
+    subagentsExtension(pi);
+    const ctx = makeCtx(cwd);
+    const id = await spawnSettled(tools, ctx);
+    vi.mocked(resumeAgent).mockResolvedValue({ text: "result", aborted: false, steered: true });
+    const res = await tools.get("Agent").execute(
+      "resume-call",
+      { prompt: "continue", description: "Continue", subagent_type: "general-purpose", resume: id, max_turns: 2, run_in_background: false },
+      undefined, undefined, ctx,
+    );
+    expect(resultText(res)).toContain("wrapped up at the turn limit");
+    expect(res.details.status).toBe("steered");
+    await lifecycle.get("session_shutdown")?.({}, ctx);
+  });
+
   // Resume follows the same default as a fresh spawn — background — so
   // foreground is now the explicit case rather than the implicit one.
   it("still resumes in the foreground when run_in_background is false", async () => {

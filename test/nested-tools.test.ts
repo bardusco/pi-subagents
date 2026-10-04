@@ -286,6 +286,33 @@ describe("child-safe nested Agent tools", () => {
     expect(manager.resume).not.toHaveBeenCalled();
   });
 
+  it.each([2, 0, undefined])("forwards nested resume cap %s without changing the original type", async maxTurns => {
+    const record = { id: "owned", type: "scout", status: "steered", result: "partial", parentAgentId: "parent-1" };
+    records.set(record.id, record);
+    vi.mocked(manager.resume).mockResolvedValue(record as never);
+    const [agent] = tools();
+    expect(agent.parameters.properties.max_turns.minimum).toBe(0);
+    const result = await execute(agent, {
+      resume: record.id, prompt: "Continue", description: "continue child",
+      subagent_type: "reviewer", model: "missing/provider", max_turns: maxTurns,
+    });
+    expect(manager.resume).toHaveBeenCalledWith(record.id, "Continue", undefined, { maxTurns });
+    expect(result.content[0].text).toContain("wrapped up at the turn limit");
+  });
+
+  it("uses the owned child's branch-scoped frontmatter before a nested resume cap", async () => {
+    writeAgent("scout", "max_turns: 3\n");
+    const record = { id: "owned", type: "scout", status: "completed", result: "done", parentAgentId: "parent-1" };
+    records.set(record.id, record);
+    vi.mocked(manager.resume).mockResolvedValue(record as never);
+    const [agent] = tools();
+    await execute(agent, {
+      resume: record.id, prompt: "Continue", description: "continue child",
+      subagent_type: "reviewer", max_turns: 9,
+    });
+    expect(manager.resume).toHaveBeenCalledWith(record.id, "Continue", undefined, { maxTurns: 3 });
+  });
+
   it("reports a background child that fails to start as a tool error", async () => {
     // Under isolation: "worktree" the child is not running when spawn() returns
     // — the repo copy is awaited. The failure must reach the parent as an error
